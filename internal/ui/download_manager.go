@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"fyne.io/fyne/v2/data/binding"
@@ -97,6 +98,40 @@ func (dm *DownloadManager) StartDownload(name string, task func(binding.Float) e
 		}
 	}()
 	return di
+}
+
+func (dm *DownloadManager) StartPersistentDownload(name string, task func(string, binding.Float) error, onDone func(string, error)) (string, *DownloadItem, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", nil, err
+	}
+	downloadDir := filepath.Join(home, "kde-connect")
+	err = os.MkdirAll(downloadDir, 0755)
+	if err != nil {
+		return "", nil, err
+	}
+
+	targetPath := filepath.Join(downloadDir, name)
+	// We no longer truncate the file here to support resuming.
+	// The task is responsible for opening the file correctly.
+
+	di := dm.Add(name)
+	di.Status.Set("Downloading...")
+
+	go func() {
+		err := task(targetPath, di.Progress)
+		if err != nil {
+			di.Status.Set("Error: " + err.Error())
+		} else {
+			di.Status.Set("Completed")
+			di.Progress.Set(1.0)
+		}
+		if onDone != nil {
+			onDone(targetPath, err)
+		}
+	}()
+
+	return targetPath, di, nil
 }
 
 func (dm *DownloadManager) StartTempDownload(name, ext string, task func(string, binding.Float) error, onDone func(string, error)) (string, *DownloadItem, error) {
