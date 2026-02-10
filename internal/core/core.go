@@ -571,18 +571,6 @@ func (e *Engine) ConnectSFTP(deviceId string) (*sftp.Client, error) {
 	e.Events.On("sftp_offer", handler)
 	defer e.Events.Off("sftp_offer", handler)
 
-	// Check if we already have a recent offer (less than 30 seconds old)
-	e.mu.RLock()
-	existingOffer, hasExisting := e.sftpOffers[deviceId]
-	e.mu.RUnlock()
-	if hasExisting && existingOffer.Port != 0 {
-		fmt.Println("Using existing SFTP offer.")
-		select {
-		case offerChan <- existingOffer:
-		default:
-		}
-	}
-
 	// 2. Send startBrowsing request
 	if err := e.triggerSftpBrowse(deviceId); err != nil {
 		return nil, err

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -24,7 +25,7 @@ import (
 
 type FileBrowser struct {
 	App        *App
-	Window     fyne.Window
+	Container  *fyne.Container
 	Client     *sftp.Client
 	List       *widget.List
 	files      []os.FileInfo
@@ -40,16 +41,12 @@ type FileBrowser struct {
 }
 
 func NewFileBrowser(parent *App, client *sftp.Client, initialPath string) *FileBrowser {
-	w := parent.FyneApp.NewWindow("File Browser")
-	w.Resize(fyne.NewSize(600, 500))
-
 	if initialPath == "" {
 		initialPath = "/"
 	}
 
 	fb := &FileBrowser{
 		App:        parent,
-		Window:     w,
 		Client:     client,
 		path:       initialPath,
 		pathString: binding.NewString(),
@@ -234,7 +231,7 @@ func (fb *FileBrowser) setupUI() {
 		}
 	}))
 
-	fb.Window.SetContent(container.NewBorder(
+	fb.Container = container.NewBorder(
 		container.NewVBox(
 			container.NewHBox(backBtn, layout.NewSpacer(), widget.NewLabel("Sort:"), sortSelect, orderSelect),
 			container.NewHBox(widget.NewLabel("Path: "), widget.NewLabelWithData(fb.pathString)),
@@ -242,7 +239,7 @@ func (fb *FileBrowser) setupUI() {
 		),
 		downloadsContainer, nil, nil,
 		container.NewStack(fb.List, fb.loadingOverlay),
-	))
+	)
 }
 
 func formatSize(size int64) string {
@@ -370,31 +367,60 @@ func (fb *FileBrowser) startDownload(f os.FileInfo) {
 		}, func(err error) {
 			fyne.Do(func() {
 				if err != nil {
-					dialog.ShowError(err, fb.Window)
+					dialog.ShowError(err, fb.App.Window)
 				} else {
-					dialog.ShowInformation("Success", fmt.Sprintf("Downloaded %s to %s", f.Name(), destPath), fb.Window)
+					dialog.ShowInformation("Success", fmt.Sprintf("Downloaded %s to %s", f.Name(), destPath), fb.App.Window)
 				}
 			})
 		})
-	}, fb.Window)
+	}, fb.App.Window)
 	d.Show()
 }
 
 func (fb *FileBrowser) downloadFile(remotePath, localPath string, size int64, progress binding.Float) error {
+	var initialOffset int64
+	var dst *os.File
+	var err error
+
+	// Check if local file already exists to resume
+	if info, err := os.Stat(localPath); err == nil {
+		if info.Size() < size {
+			fmt.Printf("Resuming download of %s from %d bytes\n", localPath, info.Size())
+			dst, err = os.OpenFile(localPath, os.O_APPEND|os.O_WRONLY, 0644)
+			initialOffset = info.Size()
+		} else if info.Size() == size {
+			fmt.Printf("File %s already fully downloaded\n", localPath)
+			progress.Set(1.0)
+			return nil
+		} else {
+			// Local file is larger? Unexpected. Just restart.
+			dst, err = os.Create(localPath)
+		}
+	} else {
+		dst, err = os.Create(localPath)
+	}
+
+	if err != nil {
+		return err
+	}
+	defer dst.Close()
+
 	src, err := fb.Client.Open(remotePath)
 	if err != nil {
 		return err
 	}
 	defer src.Close()
 
-	dst, err := os.Create(localPath)
-	if err != nil {
-		return err
+	if initialOffset > 0 {
+		_, err = src.Seek(initialOffset, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek remote file: %w", err)
+		}
 	}
-	defer dst.Close()
 
 	pw := &progressWriter{
-		total: size,
+		total:      size,
+		downloaded: initialOffset,
 		onProgress: func(p float64) {
 			progress.Set(p)
 		},
@@ -436,25 +462,23 @@ func (fb *FileBrowser) downloadDir(remotePath, localPath string, progress bindin
 func (fb *FileBrowser) openFile(f os.FileInfo) {
 	remotePath := path.Join(fb.path, f.Name())
 	ext := strings.ToLower(filepath.Ext(f.Name()))
-	isImage := ext == ".jpg" || ext == ".jpeg" || ext == ".png" || ext == ".gif"
+	isMP4 := ext == ".mp4"
 
 	fb.progress.Show()
 	fb.progress.SetValue(0)
 
-	_, di, err := fb.App.Downloads.StartTempDownload(f.Name(), ext, func(localPath string, progress binding.Float) error {
+	localPath, di, err := fb.App.Downloads.StartPersistentDownload(f.Name(), func(localPath string, progress binding.Float) error {
 		return fb.downloadFile(remotePath, localPath, f.Size(), progress)
-	}, func(tmpPath string, err error) {
+	}, func(destPath string, err error) {
 		fyne.Do(func() {
 			fb.progress.Hide()
 			if err != nil {
-				dialog.ShowError(err, fb.Window)
+				dialog.ShowError(err, fb.App.Window)
 				return
 			}
 
-			if isImage {
-				fb.showImage(f.Name(), tmpPath)
-			} else {
-				fb.openWithSystem(tmpPath)
+			if !isMP4 {
+				fb.openWithSystem(destPath)
 			}
 		})
 	})
@@ -462,6 +486,15 @@ func (fb *FileBrowser) openFile(f os.FileInfo) {
 	if err != nil {
 		fb.hideProgressError(err)
 		return
+	}
+
+	if isMP4 {
+		go func() {
+			time.Sleep(500 * time.Millisecond)
+			fyne.Do(func() {
+				fb.openWithSystem(localPath)
+			})
+		}()
 	}
 
 	// Link browser's internal progress bar to the download item
@@ -473,26 +506,17 @@ func (fb *FileBrowser) openFile(f os.FileInfo) {
 	}))
 }
 
-func (fb *FileBrowser) showImage(title, path string) {
-	img := canvas.NewImageFromFile(path)
-	img.FillMode = canvas.ImageFillContain
-	w := fb.App.FyneApp.NewWindow(title)
-	w.SetContent(container.NewMax(img))
-	w.Resize(fyne.NewSize(800, 600))
-	w.Show()
-}
-
 func (fb *FileBrowser) openWithSystem(path string) {
 	u := storage.NewFileURI(path)
 	parsedURL, _ := url.Parse(u.String())
 	if err := fb.App.FyneApp.OpenURL(parsedURL); err != nil {
-		dialog.ShowError(fmt.Errorf("could not open file: %w", err), fb.Window)
+		dialog.ShowError(fmt.Errorf("could not open file: %w", err), fb.App.Window)
 	}
 }
 
 func (fb *FileBrowser) hideProgressError(err error) {
 	fyne.Do(func() {
 		fb.progress.Hide()
-		dialog.ShowError(err, fb.Window)
+		dialog.ShowError(err, fb.App.Window)
 	})
 }

@@ -14,6 +14,8 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/driver/desktop"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"github.com/barishamil/kde-connect-fyne/internal/core"
 	"github.com/barishamil/kde-connect-fyne/internal/network"
@@ -28,12 +30,14 @@ type App struct {
 	Downloads     *DownloadManager
 	Engine        *core.Engine
 	webdavServers map[string]*network.WebDAVServer
+
+	MainContent *fyne.Container
 }
 
 func NewApp(engine *core.Engine) *App {
 	a := app.NewWithID("com.barishamil.kde-connect-fyne")
 	w := a.NewWindow("KDE Connect Fyne")
-	w.Resize(fyne.NewSize(400, 600))
+	w.Resize(fyne.NewSize(900, 600))
 
 	uiApp := &App{
 		FyneApp:       a,
@@ -42,6 +46,7 @@ func NewApp(engine *core.Engine) *App {
 		Downloads:     NewDownloadManager(),
 		Engine:        engine,
 		webdavServers: make(map[string]*network.WebDAVServer),
+		MainContent:   container.NewMax(widget.NewLabelWithStyle("Select a device to browse files", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})),
 	}
 
 	uiApp.Downloads.OnChanged = func() {
@@ -162,11 +167,13 @@ func (a *App) setupUI() {
 		a.deviceList,
 		func() fyne.CanvasObject {
 			return container.NewHBox(
+				widget.NewIcon(theme.ComputerIcon()),
 				widget.NewLabel("Device Name"),
-				widget.NewButton("Pair", func() {}),
-				widget.NewButton("Unpair", func() {}),
-				widget.NewButton("Files", func() {}),
-				widget.NewButton("Mount", func() {}),
+				layout.NewSpacer(),
+				container.NewHBox(
+					widget.NewButtonWithIcon("", theme.ViewRefreshIcon(), func() {}), // Pair/Unpair placeholder
+					widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {}),  // Files placeholder
+				),
 			)
 		},
 		func(item binding.DataItem, obj fyne.CanvasObject) {
@@ -176,11 +183,11 @@ func (a *App) setupUI() {
 			device := dev.Identity
 
 			box := obj.(*fyne.Container)
-			label := box.Objects[0].(*widget.Label)
-			pairBtn := box.Objects[1].(*widget.Button)
-			unpairBtn := box.Objects[2].(*widget.Button)
-			filesBtn := box.Objects[3].(*widget.Button)
-			mountBtn := box.Objects[4].(*widget.Button)
+			icon := box.Objects[0].(*widget.Icon)
+			label := box.Objects[1].(*widget.Label)
+			btnBox := box.Objects[3].(*fyne.Container)
+			pairBtn := btnBox.Objects[0].(*widget.Button)
+			filesBtn := btnBox.Objects[1].(*widget.Button)
 
 			name := device.DeviceName
 			if name == "" {
@@ -188,40 +195,49 @@ func (a *App) setupUI() {
 			}
 			label.SetText(name)
 
+			// Simple icon logic based on device type if available
+			switch device.DeviceType {
+			case "phone":
+				icon.SetResource(theme.ComputerIcon()) // Fyne doesn't have a phone icon in standard theme usually, but we'll use computer for now or lookup
+			case "tablet":
+				icon.SetResource(theme.ComputerIcon())
+			default:
+				icon.SetResource(theme.ComputerIcon())
+			}
+
 			if a.Engine.IsPaired(device.DeviceId) {
-				pairBtn.SetText("Paired")
-				pairBtn.Hide()
-				unpairBtn.Show()
+				pairBtn.SetIcon(theme.DeleteIcon())
+				pairBtn.Importance = widget.LowImportance
 				filesBtn.Enable()
-				mountBtn.Show()
 			} else {
-				pairBtn.SetText("Pair")
-				pairBtn.Show()
-				unpairBtn.Hide()
+				pairBtn.SetIcon(theme.ViewRefreshIcon())
+				pairBtn.Importance = widget.MediumImportance
 				filesBtn.Disable()
-				mountBtn.Hide()
 			}
 
 			pairBtn.OnTapped = func() {
-				a.pairDevice(dev)
-			}
-			unpairBtn.OnTapped = func() {
-				a.unpairDevice(dev)
+				if a.Engine.IsPaired(device.DeviceId) {
+					a.unpairDevice(dev)
+				} else {
+					a.pairDevice(dev)
+				}
 			}
 			filesBtn.OnTapped = func() {
 				a.openFileBrowser(device)
 			}
-			mountBtn.OnTapped = func() {
-				a.mountDevice(device)
-			}
 		},
 	)
 
-	a.Window.SetContent(container.NewBorder(
-		widget.NewLabel("Discovered Devices"),
+	sidebar := container.NewBorder(
+		widget.NewLabelWithStyle("Devices", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
 		nil, nil, nil,
 		a.Devices,
-	))
+	)
+
+	split := container.NewHSplit(sidebar, a.MainContent)
+	split.Offset = 0.3
+
+	a.Window.SetContent(split)
 }
 
 func (a *App) pairDevice(device core.DiscoveredDevice) {
@@ -301,7 +317,8 @@ func (a *App) openFileBrowser(device protocol.IdentityBody) {
 			}
 
 			fb := NewFileBrowser(a, client, offer.Path)
-			fb.Window.Show()
+			a.MainContent.Objects = []fyne.CanvasObject{fb.Container}
+			a.MainContent.Refresh()
 		})
 	}()
 }
