@@ -358,15 +358,15 @@ func (a *App) openWebDAV(port int) {
 	time.Sleep(300 * time.Millisecond)
 
 	var cmd *exec.Cmd
-	// Use 127.0.0.1 instead of localhost for reliability
-	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+	// Use 127.0.0.1 for reliability.
+	url := fmt.Sprintf("http://user:pass@127.0.0.1:%d/", port)
 
 	switch runtime.GOOS {
 	case "darwin":
-		// On macOS, 'mount volume' triggers Finder's network mounting logic directly.
-		// 'open location' would incorrectly open the default web browser for http:// URLs.
+		// 'mount volume' is the standard macOS way to mount network drives.
+		// If it fails with -5014, it usually means the path or address is unreachable.
 		script := fmt.Sprintf("mount volume \"%s\"", url)
-		fmt.Printf("Mounting WebDAV on macOS via AppleScript: %s\n", url)
+		fmt.Printf("Mounting WebDAV on macOS: %s\n", url)
 		cmd = exec.Command("osascript", "-e", script)
 	case "linux":
 		// Linux: try dav:// for file managers
