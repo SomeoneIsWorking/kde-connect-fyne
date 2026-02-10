@@ -85,6 +85,13 @@ func (e *Engine) LoadConfig() error {
 		}
 		if isNew && len(newFormat) > 0 {
 			e.mu.Lock()
+			// Ensure defaults for loaded devices
+			for k, v := range newFormat {
+				if v.LastPort == 0 {
+					v.LastPort = 1716
+				}
+				newFormat[k] = v
+			}
 			e.pairedDevices = newFormat
 			e.mu.Unlock()
 			return nil
@@ -96,7 +103,11 @@ func (e *Engine) LoadConfig() error {
 	if err := json.Unmarshal(raw.PairedDevices, &oldFormat); err == nil {
 		e.mu.Lock()
 		for k, v := range oldFormat {
-			e.pairedDevices[k] = PairedDeviceInfo{Identity: v}
+			port := v.TcpPort
+			if port == 0 {
+				port = 1716
+			}
+			e.pairedDevices[k] = PairedDeviceInfo{Identity: v, LastPort: port}
 		}
 		e.mu.Unlock()
 	}

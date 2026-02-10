@@ -3,6 +3,10 @@ package ui
 import (
 	"fmt"
 	"net"
+	"os/exec"
+	"runtime"
+	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -12,16 +16,18 @@ import (
 	"fyne.io/fyne/v2/driver/desktop"
 	"fyne.io/fyne/v2/widget"
 	"github.com/barishamil/kde-connect-fyne/internal/core"
+	"github.com/barishamil/kde-connect-fyne/internal/network"
 	"github.com/barishamil/kde-connect-fyne/internal/protocol"
 )
 
 type App struct {
-	FyneApp    fyne.App
-	Window     fyne.Window
-	Devices    *widget.List
-	deviceList binding.UntypedList
-	Downloads  *DownloadManager
-	Engine     *core.Engine
+	FyneApp       fyne.App
+	Window        fyne.Window
+	Devices       *widget.List
+	deviceList    binding.UntypedList
+	Downloads     *DownloadManager
+	Engine        *core.Engine
+	webdavServers map[string]*network.WebDAVServer
 }
 
 func NewApp(engine *core.Engine) *App {
@@ -30,11 +36,12 @@ func NewApp(engine *core.Engine) *App {
 	w.Resize(fyne.NewSize(400, 600))
 
 	uiApp := &App{
-		FyneApp:    a,
-		Window:     w,
-		deviceList: binding.NewUntypedList(),
-		Downloads:  NewDownloadManager(),
-		Engine:     engine,
+		FyneApp:       a,
+		Window:        w,
+		deviceList:    binding.NewUntypedList(),
+		Downloads:     NewDownloadManager(),
+		Engine:        engine,
+		webdavServers: make(map[string]*network.WebDAVServer),
 	}
 
 	uiApp.Downloads.OnChanged = func() {
@@ -159,6 +166,7 @@ func (a *App) setupUI() {
 				widget.NewButton("Pair", func() {}),
 				widget.NewButton("Unpair", func() {}),
 				widget.NewButton("Files", func() {}),
+				widget.NewButton("Mount", func() {}),
 			)
 		},
 		func(item binding.DataItem, obj fyne.CanvasObject) {
@@ -172,6 +180,7 @@ func (a *App) setupUI() {
 			pairBtn := box.Objects[1].(*widget.Button)
 			unpairBtn := box.Objects[2].(*widget.Button)
 			filesBtn := box.Objects[3].(*widget.Button)
+			mountBtn := box.Objects[4].(*widget.Button)
 
 			name := device.DeviceName
 			if name == "" {
@@ -184,11 +193,13 @@ func (a *App) setupUI() {
 				pairBtn.Hide()
 				unpairBtn.Show()
 				filesBtn.Enable()
+				mountBtn.Show()
 			} else {
 				pairBtn.SetText("Pair")
 				pairBtn.Show()
 				unpairBtn.Hide()
 				filesBtn.Disable()
+				mountBtn.Hide()
 			}
 
 			pairBtn.OnTapped = func() {
@@ -199,6 +210,9 @@ func (a *App) setupUI() {
 			}
 			filesBtn.OnTapped = func() {
 				a.openFileBrowser(device)
+			}
+			mountBtn.OnTapped = func() {
+				a.mountDevice(device)
 			}
 		},
 	)
@@ -290,6 +304,94 @@ func (a *App) openFileBrowser(device protocol.IdentityBody) {
 			fb.Window.Show()
 		})
 	}()
+}
+
+func (a *App) mountDevice(device protocol.IdentityBody) {
+	fmt.Printf("Mounting %s to Finder...\n", device.DeviceName)
+
+	if s, ok := a.webdavServers[device.DeviceId]; ok {
+		a.openWebDAV(s.Port)
+		return
+	}
+
+	go func() {
+		client, err := a.Engine.ConnectSFTP(device.DeviceId)
+		offer, _ := a.Engine.GetSftpOffer(device.DeviceId)
+
+		fyne.Do(func() {
+			if err != nil {
+				dialog.ShowError(err, a.Window)
+				return
+			}
+
+			d := dialog.NewCustom("Mounting", "Close", container.NewVBox(
+				widget.NewLabel("Establishing SFTP connection and starting WebDAV bridge..."),
+				widget.NewProgressBarInfinite(),
+			), a.Window)
+			d.Show()
+
+			go func() {
+				defer func() {
+					fyne.Do(d.Hide)
+				}()
+
+				srv := network.NewWebDAVServer(client, offer.Path)
+				if err := srv.Start(); err != nil {
+					fyne.Do(func() {
+						dialog.ShowError(fmt.Errorf("failed to start WebDAV bridge: %w", err), a.Window)
+					})
+					return
+				}
+
+				a.webdavServers[device.DeviceId] = srv
+
+				fyne.Do(func() {
+					a.openWebDAV(srv.Port)
+				})
+			}()
+		})
+	}()
+}
+
+func (a *App) openWebDAV(port int) {
+	// Give the server a moment to start
+	time.Sleep(300 * time.Millisecond)
+
+	var cmd *exec.Cmd
+	// Use 127.0.0.1 instead of localhost for reliability
+	url := fmt.Sprintf("http://127.0.0.1:%d/", port)
+
+	switch runtime.GOOS {
+	case "darwin":
+		// On macOS, 'mount volume' triggers Finder's network mounting logic directly.
+		// 'open location' would incorrectly open the default web browser for http:// URLs.
+		script := fmt.Sprintf("mount volume \"%s\"", url)
+		fmt.Printf("Mounting WebDAV on macOS via AppleScript: %s\n", url)
+		cmd = exec.Command("osascript", "-e", script)
+	case "linux":
+		// Linux: try dav:// for file managers
+		cmd = exec.Command("xdg-open", strings.Replace(url, "http://", "dav://", 1))
+	case "windows":
+		// Windows: use explorer
+		cmd = exec.Command("explorer", url)
+	default:
+		return
+	}
+
+	fmt.Printf("Executing: %s %s\n", cmd.Path, strings.Join(cmd.Args[1:], " "))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		fmt.Printf("Error opening WebDAV (output: %s): %v\n", string(output), err)
+		// Fallback for macOS: try open command
+		if runtime.GOOS == "darwin" {
+			urlHttp := fmt.Sprintf("http://127.0.0.1:%d/", port)
+			fmt.Printf("Retrying with 'open %s'\n", urlHttp)
+			retryCmd := exec.Command("open", urlHttp)
+			retryCmd.Run()
+		}
+	} else {
+		fmt.Println("WebDAV mount command sent successfully")
+	}
 }
 
 func (a *App) Run() {

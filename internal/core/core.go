@@ -334,6 +334,7 @@ func (e *Engine) getOrConnect(deviceId string) (*network.Connection, error) {
 	}
 
 	if ip == "" || port == 0 {
+		fmt.Printf("Connection error for %s: IP='%s', Port=%d (discovered=%v, paired=%v)\n", deviceId, ip, port, discovered, paired)
 		return nil, fmt.Errorf("missing address for device %s", deviceId)
 	}
 
@@ -401,24 +402,29 @@ func (e *Engine) GetPairedDevices() []PairedDeviceInfo {
 
 func (e *Engine) addDiscoveredDevice(identity protocol.IdentityBody, addr *net.UDPAddr) {
 	e.mu.Lock()
+	defer e.mu.Unlock() // Use defer to ensure unlock
+
+	if identity.TcpPort == 0 {
+		identity.TcpPort = 1716 // Default KDE Connect port
+	}
+
 	dev := DiscoveredDevice{Identity: identity, Addr: addr}
 	e.discoveredDevices[identity.DeviceId] = dev
 
 	// Update paired device info if it exists to persist last known IP
 	changed := false
 	if info, ok := e.pairedDevices[identity.DeviceId]; ok {
-		if info.LastIP != addr.IP.String() || info.Identity.DeviceName != identity.DeviceName {
+		if info.LastIP != addr.IP.String() || info.LastPort != identity.TcpPort || info.Identity.DeviceName != identity.DeviceName {
 			info.LastIP = addr.IP.String()
-			info.LastPort = addr.Port
+			info.LastPort = identity.TcpPort
 			info.Identity = identity
 			e.pairedDevices[identity.DeviceId] = info
 			changed = true
 		}
 	}
-	e.mu.Unlock()
 
 	if changed {
-		e.SaveConfig()
+		go e.SaveConfig() // Save in background
 	}
 
 	e.Events.Emit("device_discovered", dev)
