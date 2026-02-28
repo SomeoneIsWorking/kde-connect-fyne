@@ -10,21 +10,26 @@ import (
 )
 
 type DownloadItem struct {
-	ID       string
-	Name     string
-	Progress binding.Float
-	Status   binding.String
+	ID        string
+	Name      string
+	Progress  binding.Float
+	Status    binding.String
+	LocalPath binding.String
 }
 
 type DownloadManager struct {
-	Downloads binding.UntypedList
-	OnChanged func()
+	Downloads   binding.UntypedList
+	OnChanged   func()
+	MaxParallel int
+	sem         chan struct{}
 }
 
 func NewDownloadManager() *DownloadManager {
 	dm := &DownloadManager{
-		Downloads: binding.NewUntypedList(),
+		Downloads:   binding.NewUntypedList(),
+		MaxParallel: 3,
 	}
+	dm.sem = make(chan struct{}, dm.MaxParallel)
 	dm.Downloads.AddListener(binding.NewDataListener(func() {
 		if dm.OnChanged != nil {
 			dm.OnChanged()
@@ -35,16 +40,19 @@ func NewDownloadManager() *DownloadManager {
 
 func (dm *DownloadManager) Add(name string) *DownloadItem {
 	item := &DownloadItem{
-		ID:       fmt.Sprintf("%d", time.Now().UnixNano()),
-		Name:     name,
-		Progress: binding.NewFloat(),
-		Status:   binding.NewString(),
+		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+		Name:      name,
+		Progress:  binding.NewFloat(),
+		Status:    binding.NewString(),
+		LocalPath: binding.NewString(),
 	}
 	item.Status.Set("Starting...")
+	item.LocalPath.Set("")
 
 	// Add listener to progress/status to trigger OnChanged
 	item.Progress.AddListener(binding.NewDataListener(dm.notify))
 	item.Status.AddListener(binding.NewDataListener(dm.notify))
+	item.LocalPath.AddListener(binding.NewDataListener(dm.notify))
 
 	dm.Downloads.Append(item)
 	return item
@@ -82,11 +90,15 @@ func (dm *DownloadManager) GetRecent(count int) []*DownloadItem {
 	return recent
 }
 
-func (dm *DownloadManager) StartDownload(name string, task func(binding.Float) error, onDone func(error)) *DownloadItem {
-	di := dm.Add(name)
-	di.Status.Set("Downloading...")
+func (dm *DownloadManager) runTask(di *DownloadItem, task func() error, onDone func(error)) {
 	go func() {
-		err := task(di.Progress)
+		di.Status.Set("Queued")
+		dm.sem <- struct{}{}
+		di.Status.Set("Downloading...")
+
+		err := task()
+		<-dm.sem
+
 		if err != nil {
 			di.Status.Set("Error: " + err.Error())
 		} else {
@@ -97,6 +109,13 @@ func (dm *DownloadManager) StartDownload(name string, task func(binding.Float) e
 			onDone(err)
 		}
 	}()
+}
+
+func (dm *DownloadManager) StartDownload(name string, task func(binding.Float) error, onDone func(error)) *DownloadItem {
+	di := dm.Add(name)
+	dm.runTask(di, func() error {
+		return task(di.Progress)
+	}, onDone)
 	return di
 }
 
@@ -116,20 +135,14 @@ func (dm *DownloadManager) StartPersistentDownload(name string, task func(string
 	// The task is responsible for opening the file correctly.
 
 	di := dm.Add(name)
-	di.Status.Set("Downloading...")
-
-	go func() {
-		err := task(targetPath, di.Progress)
-		if err != nil {
-			di.Status.Set("Error: " + err.Error())
-		} else {
-			di.Status.Set("Completed")
-			di.Progress.Set(1.0)
-		}
+	di.LocalPath.Set(targetPath)
+	dm.runTask(di, func() error {
+		return task(targetPath, di.Progress)
+	}, func(err error) {
 		if onDone != nil {
 			onDone(targetPath, err)
 		}
-	}()
+	})
 
 	return targetPath, di, nil
 }
@@ -143,20 +156,14 @@ func (dm *DownloadManager) StartTempDownload(name, ext string, task func(string,
 	tmpFile.Close()
 
 	di := dm.Add(name)
-	di.Status.Set("Downloading...")
-
-	go func() {
-		err := task(tmpPath, di.Progress)
-		if err != nil {
-			di.Status.Set("Error: " + err.Error())
-		} else {
-			di.Status.Set("Completed")
-			di.Progress.Set(1.0)
-		}
+	di.LocalPath.Set(tmpPath)
+	dm.runTask(di, func() error {
+		return task(tmpPath, di.Progress)
+	}, func(err error) {
 		if onDone != nil {
 			onDone(tmpPath, err)
 		}
-	}()
+	})
 
 	return tmpPath, di, nil
 }

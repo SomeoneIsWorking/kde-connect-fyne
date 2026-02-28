@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -31,14 +34,23 @@ type FileBrowser struct {
 	files      []os.FileInfo
 	path       string
 	pathString binding.String
-	progress   *widget.ProgressBar
 
 	loadingOverlay *fyne.Container
 	cancelRefresh  chan struct{}
 
 	sortBy    string // "name", "size", "date"
 	sortOrder int    // 1 for asc, -1 for desc
+
+	lastSelectedID         widget.ListItemID
+	lastSelectAt           time.Time
+	lastDownloadSelectedID widget.ListItemID
+	lastDownloadSelectAt   time.Time
+
+	downloadedPaths map[string]string
 }
+
+const streamPrebufferBytes int64 = 10 * 1024 * 1024
+const fileListDoubleClickThreshold = 450 * time.Millisecond
 
 func NewFileBrowser(parent *App, client *sftp.Client, initialPath string) *FileBrowser {
 	if initialPath == "" {
@@ -46,15 +58,16 @@ func NewFileBrowser(parent *App, client *sftp.Client, initialPath string) *FileB
 	}
 
 	fb := &FileBrowser{
-		App:        parent,
-		Client:     client,
-		path:       initialPath,
-		pathString: binding.NewString(),
-		progress:   widget.NewProgressBar(),
-		sortBy:     "name",
-		sortOrder:  1,
+		App:                    parent,
+		Client:                 client,
+		path:                   initialPath,
+		pathString:             binding.NewString(),
+		sortBy:                 "name",
+		sortOrder:              1,
+		lastSelectedID:         -1,
+		lastDownloadSelectedID: -1,
+		downloadedPaths:        make(map[string]string),
 	}
-	fb.progress.Hide()
 	fb.pathString.Set(fb.path)
 
 	fb.setupUI()
@@ -107,12 +120,10 @@ func (fb *FileBrowser) setupUI() {
 					widget.NewIcon(theme.FileIcon()),
 					canvas.NewImageFromResource(theme.FileIcon()),
 				),
-				container.NewVBox(
-					widget.NewLabel("file name"),
-					widget.NewLabel("size / date"),
-				),
+				widget.NewLabel("file name · size/date"),
 				layout.NewSpacer(),
-				widget.NewButtonWithIcon("", theme.DownloadIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.VisibilityIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {}),
 			)
 		},
 		func(id widget.ListItemID, obj fyne.CanvasObject) {
@@ -124,10 +135,9 @@ func (fb *FileBrowser) setupUI() {
 			stack := box.Objects[0].(*fyne.Container)
 			icon := stack.Objects[0].(*widget.Icon)
 			thumb := stack.Objects[1].(*canvas.Image)
-			infoBox := box.Objects[1].(*fyne.Container)
-			nameLabel := infoBox.Objects[0].(*widget.Label)
-			detailLabel := infoBox.Objects[1].(*widget.Label)
-			btn := box.Objects[3].(*widget.Button)
+			infoLabel := box.Objects[1].(*widget.Label)
+			actionBtn := box.Objects[3].(*widget.Button)
+			revealBtn := box.Objects[4].(*widget.Button)
 
 			// Reset thumb
 			thumb.Hide()
@@ -135,7 +145,19 @@ func (fb *FileBrowser) setupUI() {
 
 			if f.IsDir() {
 				icon.SetResource(theme.FolderIcon())
-				detailLabel.SetText(fmt.Sprintf("%s", f.ModTime().Format("2006-01-02 15:04")))
+				infoLabel.SetText(fmt.Sprintf("%s · %s", f.Name(), f.ModTime().Format("2006-01-02 15:04")))
+				actionBtn.SetIcon(theme.NavigateNextIcon())
+				actionBtn.SetText("")
+				actionBtn.Enable()
+				actionBtn.OnTapped = func() {
+					fb.path = path.Join(fb.path, f.Name())
+					fb.pathString.Set(fb.path)
+					fb.refreshFiles()
+				}
+				revealBtn.Disable()
+				revealBtn.SetText("")
+				revealBtn.SetIcon(theme.FolderOpenIcon())
+				revealBtn.OnTapped = nil
 			} else {
 				ext := strings.ToLower(filepath.Ext(f.Name()))
 				switch ext {
@@ -146,11 +168,33 @@ func (fb *FileBrowser) setupUI() {
 				default:
 					icon.SetResource(theme.FileIcon())
 				}
-				detailLabel.SetText(fmt.Sprintf("%s | %s", formatSize(f.Size()), f.ModTime().Format("2006-01-02 15:04")))
-			}
-			nameLabel.SetText(f.Name())
-			btn.OnTapped = func() {
-				fb.startDownload(f)
+				infoLabel.SetText(fmt.Sprintf("%s · %s · %s", f.Name(), formatSize(f.Size()), f.ModTime().Format("2006-01-02 15:04")))
+				actionBtn.SetIcon(theme.VisibilityIcon())
+				actionBtn.SetText("")
+				actionBtn.Enable()
+				actionBtn.OnTapped = func() {
+					fb.openFile(f)
+				}
+
+				revealBtn.SetIcon(theme.FolderOpenIcon())
+				revealBtn.SetText("")
+				remotePath := path.Join(fb.path, f.Name())
+				revealPath := fb.resolveDownloadedPath(remotePath, f.Name())
+				if revealPath == "" {
+					revealBtn.Disable()
+				} else {
+					revealBtn.Enable()
+				}
+				revealBtn.OnTapped = func() {
+					revealPath := fb.resolveDownloadedPath(remotePath, f.Name())
+					if revealPath == "" {
+						dialog.ShowInformation("Not downloaded yet", "Preview this file first to create a local copy.", fb.App.Window)
+						return
+					}
+					if err := revealInFileManager(revealPath); err != nil {
+						dialog.ShowError(err, fb.App.Window)
+					}
+				}
 			}
 
 			fb.loadThumbnail(id, f, thumb, icon, box)
@@ -158,22 +202,24 @@ func (fb *FileBrowser) setupUI() {
 	)
 
 	fb.List.OnSelected = func(id widget.ListItemID) {
-		if id >= len(fb.files) {
-			return
-		}
-		f := fb.files[id]
-		if f.IsDir() {
-			fb.path = path.Join(fb.path, f.Name())
-			fb.pathString.Set(fb.path)
-			fb.refreshFiles()
+		now := time.Now()
+		if id == fb.lastSelectedID && now.Sub(fb.lastSelectAt) <= fileListDoubleClickThreshold {
+			fb.handleListDoubleClick(id)
+			fb.lastSelectedID = -1
+			fb.lastSelectAt = time.Time{}
 		} else {
-			fb.openFile(f)
+			fb.lastSelectedID = id
+			fb.lastSelectAt = now
 		}
+		fb.List.Unselect(id)
 	}
 
 	backBtn := widget.NewButtonWithIcon("Back", theme.NavigateBackIcon(), func() {
 		fb.path = path.Dir(fb.path)
 		fb.pathString.Set(fb.path)
+		fb.refreshFiles()
+	})
+	refreshBtn := widget.NewButtonWithIcon("Refresh", theme.ViewRefreshIcon(), func() {
 		fb.refreshFiles()
 	})
 
@@ -198,27 +244,103 @@ func (fb *FileBrowser) setupUI() {
 	downloadsList := widget.NewListWithData(
 		fb.App.Downloads.Downloads,
 		func() fyne.CanvasObject {
-			return container.NewVBox(
+			progress := widget.NewProgressBar()
+			progress.Min = 0
+			progress.Max = 1
+			progress.Resize(fyne.NewSize(140, progress.MinSize().Height))
+			return container.NewHBox(
+				widget.NewIcon(theme.DownloadIcon()),
 				widget.NewLabel("filename"),
-				widget.NewProgressBar(),
+				widget.NewLabel("status"),
+				progress,
+				layout.NewSpacer(),
+				widget.NewButtonWithIcon("", theme.VisibilityIcon(), func() {}),
+				widget.NewButtonWithIcon("", theme.FolderOpenIcon(), func() {}),
 			)
 		},
 		func(i binding.DataItem, o fyne.CanvasObject) {
 			item, _ := i.(binding.Untyped).Get()
 			download := item.(*DownloadItem)
 			box := o.(*fyne.Container)
-			name := box.Objects[0].(*widget.Label)
-			prog := box.Objects[1].(*widget.ProgressBar)
+			name := box.Objects[1].(*widget.Label)
+			status := box.Objects[2].(*widget.Label)
+			prog := box.Objects[3].(*widget.ProgressBar)
+			preview := box.Objects[5].(*widget.Button)
+			reveal := box.Objects[6].(*widget.Button)
 
 			name.SetText(download.Name)
+			status.Bind(download.Status)
 			prog.Bind(download.Progress)
+			preview.SetText("")
+			preview.SetIcon(theme.VisibilityIcon())
+			reveal.SetText("")
+			reveal.SetIcon(theme.FolderOpenIcon())
+
+			localPath := fb.resolveDownloadedPath("", download.Name)
+			if localPath == "" {
+				localPath, _ = download.LocalPath.Get()
+			}
+			if localPath == "" {
+				preview.Disable()
+				reveal.Disable()
+			} else {
+				if fb.isPreviewableName(download.Name) {
+					preview.Enable()
+				} else {
+					preview.Disable()
+				}
+				reveal.Enable()
+			}
+			preview.OnTapped = func() {
+				localPath, _ := download.LocalPath.Get()
+				if localPath == "" {
+					localPath = fb.resolveDownloadedPath("", download.Name)
+				}
+				if localPath == "" {
+					dialog.ShowInformation("Not available", "This download has no local file path.", fb.App.Window)
+					return
+				}
+				fb.openWithSystem(localPath)
+			}
+			reveal.OnTapped = func() {
+				localPath, _ := download.LocalPath.Get()
+				if localPath == "" {
+					localPath = fb.resolveDownloadedPath("", download.Name)
+				}
+				if localPath == "" {
+					dialog.ShowInformation("Not available", "This download has no local file path.", fb.App.Window)
+					return
+				}
+				if err := revealInFileManager(localPath); err != nil {
+					dialog.ShowError(err, fb.App.Window)
+				}
+			}
 		},
 	)
 
-	downloadsContainer := container.NewVBox(
-		widget.NewSeparator(),
-		widget.NewLabel("Active Downloads"),
-		container.NewStack(downloadsList),
+	downloadsList.OnSelected = func(id widget.ListItemID) {
+		now := time.Now()
+		if id == fb.lastDownloadSelectedID && now.Sub(fb.lastDownloadSelectAt) <= fileListDoubleClickThreshold {
+			fb.handleDownloadDoubleClick(downloadsList, id)
+			fb.lastDownloadSelectedID = -1
+			fb.lastDownloadSelectAt = time.Time{}
+		} else {
+			fb.lastDownloadSelectedID = id
+			fb.lastDownloadSelectAt = now
+		}
+		downloadsList.Unselect(id)
+	}
+
+	downloadsScroll := container.NewVScroll(downloadsList)
+	downloadsScroll.SetMinSize(fyne.NewSize(0, 110))
+	downloadsScroll.Resize(fyne.NewSize(0, 130))
+
+	downloadsContainer := container.NewBorder(
+		container.NewHBox(widget.NewLabelWithStyle("Downloads", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}), layout.NewSpacer()),
+		nil,
+		nil,
+		nil,
+		downloadsScroll,
 	)
 	downloadsContainer.Hide()
 
@@ -229,17 +351,86 @@ func (fb *FileBrowser) setupUI() {
 		} else {
 			downloadsContainer.Hide()
 		}
+		fyne.Do(func() {
+			fb.List.Refresh()
+			downloadsList.Refresh()
+		})
 	}))
 
-	fb.Container = container.NewBorder(
-		container.NewVBox(
-			container.NewHBox(backBtn, layout.NewSpacer(), widget.NewLabel("Sort:"), sortSelect, orderSelect),
-			container.NewHBox(widget.NewLabel("Path: "), widget.NewLabelWithData(fb.pathString)),
-			fb.progress,
-		),
-		downloadsContainer, nil, nil,
-		container.NewStack(fb.List, fb.loadingOverlay),
+	centerSplit := container.NewVSplit(
+		widget.NewCard("Remote Files", "", container.NewStack(
+			fb.List,
+			fb.loadingOverlay,
+		)),
+		downloadsContainer,
 	)
+	centerSplit.Offset = 0.82
+
+	fb.Container = container.NewBorder(
+		widget.NewCard("", "", container.NewVBox(
+			container.NewHBox(backBtn, refreshBtn, layout.NewSpacer(), widget.NewLabel("Sort:"), sortSelect, orderSelect),
+			container.NewHBox(widget.NewIcon(theme.FolderOpenIcon()), widget.NewLabelWithData(fb.pathString)),
+		)),
+		nil, nil, nil,
+		centerSplit,
+	)
+}
+
+func (fb *FileBrowser) handleListDoubleClick(id widget.ListItemID) {
+	if id < 0 || id >= len(fb.files) {
+		return
+	}
+
+	f := fb.files[id]
+	if f.IsDir() {
+		fb.path = path.Join(fb.path, f.Name())
+		fb.pathString.Set(fb.path)
+		fb.refreshFiles()
+		return
+	}
+
+	if fb.isPreviewableMedia(f) {
+		fb.openFile(f)
+	}
+}
+
+func (fb *FileBrowser) handleDownloadDoubleClick(downloadsList *widget.List, id widget.ListItemID) {
+	items, err := fb.App.Downloads.Downloads.Get()
+	if err != nil || id < 0 || id >= len(items) {
+		return
+	}
+
+	d, ok := items[id].(*DownloadItem)
+	if !ok || !fb.isPreviewableName(d.Name) {
+		return
+	}
+
+	localPath, _ := d.LocalPath.Get()
+	if localPath == "" {
+		localPath = fb.resolveDownloadedPath("", d.Name)
+	}
+	if localPath == "" {
+		return
+	}
+
+	fb.openWithSystem(localPath)
+	downloadsList.Unselect(id)
+}
+
+func (fb *FileBrowser) isPreviewableMedia(f os.FileInfo) bool {
+	if f == nil || f.IsDir() {
+		return false
+	}
+	return fb.isPreviewableName(f.Name())
+}
+
+func (fb *FileBrowser) isPreviewableName(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".mp4", ".mkv", ".avi", ".mov", ".webm":
+		return true
+	default:
+		return false
+	}
 }
 
 func formatSize(size int64) string {
@@ -359,7 +550,7 @@ func (fb *FileBrowser) startDownload(f os.FileInfo) {
 		remotePath := path.Join(fb.path, f.Name())
 		localPath := filepath.Join(destPath, f.Name())
 
-		fb.App.Downloads.StartDownload(f.Name(), func(progress binding.Float) error {
+		di := fb.App.Downloads.StartDownload(f.Name(), func(progress binding.Float) error {
 			if f.IsDir() {
 				return fb.downloadDir(remotePath, localPath, progress)
 			}
@@ -373,6 +564,8 @@ func (fb *FileBrowser) startDownload(f os.FileInfo) {
 				}
 			})
 		})
+		di.LocalPath.Set(localPath)
+		fb.downloadedPaths[remotePath] = localPath
 	}, fb.App.Window)
 	d.Show()
 }
@@ -464,14 +657,10 @@ func (fb *FileBrowser) openFile(f os.FileInfo) {
 	ext := strings.ToLower(filepath.Ext(f.Name()))
 	isMP4 := ext == ".mp4"
 
-	fb.progress.Show()
-	fb.progress.SetValue(0)
-
 	localPath, di, err := fb.App.Downloads.StartPersistentDownload(f.Name(), func(localPath string, progress binding.Float) error {
 		return fb.downloadFile(remotePath, localPath, f.Size(), progress)
 	}, func(destPath string, err error) {
 		fyne.Do(func() {
-			fb.progress.Hide()
 			if err != nil {
 				dialog.ShowError(err, fb.App.Window)
 				return
@@ -484,26 +673,144 @@ func (fb *FileBrowser) openFile(f os.FileInfo) {
 	})
 
 	if err != nil {
-		fb.hideProgressError(err)
+		dialog.ShowError(err, fb.App.Window)
 		return
 	}
+	fb.downloadedPaths[remotePath] = localPath
 
 	if isMP4 {
 		go func() {
-			time.Sleep(500 * time.Millisecond)
+			fb.waitForVideoPrebuffer(localPath, f.Size(), di)
+		}()
+	}
+}
+
+func (fb *FileBrowser) revealActionLabel() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "Reveal in Finder"
+	case "windows":
+		return "Show in Explorer"
+	default:
+		return "Reveal in Files"
+	}
+}
+
+func (fb *FileBrowser) resolveDownloadedPath(remotePath, name string) string {
+	if remotePath != "" {
+		if localPath, ok := fb.downloadedPaths[remotePath]; ok {
+			if localPath != "" {
+				if _, err := os.Stat(localPath); err == nil {
+					return localPath
+				}
+			}
+		}
+	}
+
+	items, _ := fb.App.Downloads.Downloads.Get()
+	for i := len(items) - 1; i >= 0; i-- {
+		d, ok := items[i].(*DownloadItem)
+		if !ok || d.Name != name {
+			continue
+		}
+		localPath, _ := d.LocalPath.Get()
+		if localPath != "" {
+			if _, err := os.Stat(localPath); err == nil {
+				if remotePath != "" {
+					fb.downloadedPaths[remotePath] = localPath
+				}
+				return localPath
+			}
+		}
+	}
+
+	if guessed := fb.defaultDownloadPath(name); guessed != "" {
+		if _, err := os.Stat(guessed); err == nil {
+			if remotePath != "" {
+				fb.downloadedPaths[remotePath] = guessed
+			}
+			return guessed
+		}
+	}
+
+	return ""
+}
+
+func (fb *FileBrowser) defaultDownloadPath(name string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, "kde-connect", name)
+}
+
+func revealInFileManager(targetPath string) error {
+	if targetPath == "" {
+		return errors.New("no path to reveal")
+	}
+
+	absPath, err := filepath.Abs(targetPath)
+	if err != nil {
+		return err
+	}
+
+	if _, statErr := os.Stat(absPath); statErr != nil {
+		return fmt.Errorf("file is not available locally yet: %w", statErr)
+	}
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", "-R", absPath)
+	case "windows":
+		cmd = exec.Command("explorer", "/select,", filepath.Clean(absPath))
+	default:
+		dir := absPath
+		if info, err := os.Stat(absPath); err == nil && !info.IsDir() {
+			dir = filepath.Dir(absPath)
+		}
+		cmd = exec.Command("xdg-open", dir)
+	}
+
+	if out, runErr := cmd.CombinedOutput(); runErr != nil {
+		return fmt.Errorf("failed to open file manager: %w (%s)", runErr, string(out))
+	}
+
+	return nil
+}
+
+func (fb *FileBrowser) waitForVideoPrebuffer(localPath string, totalSize int64, di *DownloadItem) {
+	targetBytes := streamPrebufferBytes
+	if totalSize > 0 && totalSize < targetBytes {
+		targetBytes = totalSize
+	}
+
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		status, _ := di.Status.Get()
+		if strings.HasPrefix(status, "Error:") {
+			return
+		}
+
+		info, err := os.Stat(localPath)
+		if err == nil && info.Size() >= targetBytes {
 			fyne.Do(func() {
 				fb.openWithSystem(localPath)
 			})
-		}()
-	}
+			return
+		}
 
-	// Link browser's internal progress bar to the download item
-	di.Progress.AddListener(binding.NewDataListener(func() {
-		val, _ := di.Progress.Get()
-		fyne.Do(func() {
-			fb.progress.SetValue(val)
-		})
-	}))
+		if status == "Completed" {
+			if err == nil && info.Size() > 0 {
+				fyne.Do(func() {
+					fb.openWithSystem(localPath)
+				})
+			}
+			return
+		}
+	}
 }
 
 func (fb *FileBrowser) openWithSystem(path string) {
@@ -512,11 +819,4 @@ func (fb *FileBrowser) openWithSystem(path string) {
 	if err := fb.App.FyneApp.OpenURL(parsedURL); err != nil {
 		dialog.ShowError(fmt.Errorf("could not open file: %w", err), fb.App.Window)
 	}
-}
-
-func (fb *FileBrowser) hideProgressError(err error) {
-	fyne.Do(func() {
-		fb.progress.Hide()
-		dialog.ShowError(err, fb.App.Window)
-	})
 }

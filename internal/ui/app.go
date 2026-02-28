@@ -229,15 +229,30 @@ func (a *App) setupUI() {
 	)
 
 	sidebar := container.NewBorder(
-		widget.NewLabelWithStyle("Devices", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+		container.NewVBox(
+			widget.NewLabelWithStyle("Devices", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+			widget.NewSeparator(),
+		),
 		nil, nil, nil,
-		a.Devices,
+		widget.NewCard("", "", a.Devices),
 	)
 
 	split := container.NewHSplit(sidebar, a.MainContent)
-	split.Offset = 0.3
+	split.Offset = 0.28
 
-	a.Window.SetContent(split)
+	header := container.NewHBox(
+		widget.NewIcon(theme.ComputerIcon()),
+		widget.NewLabelWithStyle("KDE Connect Fyne", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		layout.NewSpacer(),
+	)
+
+	a.Window.SetContent(container.NewBorder(
+		widget.NewCard("", "", header),
+		nil,
+		nil,
+		nil,
+		container.NewPadded(split),
+	))
 }
 
 func (a *App) pairDevice(device core.DiscoveredDevice) {
